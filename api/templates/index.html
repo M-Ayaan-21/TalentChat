@@ -1,0 +1,376 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>TalentChat</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="csrf-token" content="{% csrf_token %}">
+<style>
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,sans-serif;background:#0f171f;color:#e2e8f0;-webkit-font-smoothing:antialiased;}
+  header{position:sticky;top:0;z-index:10;background:rgba(15,23,31,.85);backdrop-filter:blur(8px);display:flex;justify-content:space-between;align-items:center;padding:12px 24px;border-bottom:1px solid #2e3d4a}
+  h1{margin:0;font-size:1.05rem;font-weight:600;}
+  main{display:grid;grid-template-columns:250px 1fr;min-height:calc(100vh - 56px);}
+  aside{background:#151f27;border-right:1px solid #253543;padding:18px 18px 120px;overflow-y:auto;}
+  .main{padding:26px 38px 140px;overflow-y:auto;display:flex;flex-direction:column;gap:34px;max-width:1320px;margin:0 auto;}
+  label{display:block;font-size:.66rem;font-weight:600;letter-spacing:.55px;color:#9fb0bf;margin:0 0 14px;text-transform:uppercase;}
+  input,select,textarea{width:100%;background:#1f2c36;border:1px solid #304350;color:#e2e8f0;border-radius:8px;font-size:.8rem;padding:9px 11px;font-family:inherit;transition:border .16s, background .16s;}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:#4d87ff;background:#243441;}
+  textarea{resize:vertical;min-height:160px;line-height:1.42;font-size:.82rem;}
+  button{cursor:pointer;font-family:inherit;border:none;border-radius:8px;padding:9px 16px;font-size:.72rem;font-weight:600;letter-spacing:.4px;display:inline-flex;align-items:center;gap:6px;transition:background .15s,box-shadow .15s;}
+  .btn-primary{background:#4d87ff;color:#fff;}
+  .btn-primary:hover{background:#3c74ec;}
+  .btn-secondary{background:#243441;color:#e2e8f0;}
+  .btn-secondary:hover{background:#2f4759;}
+  .btn-outline{background:transparent;color:#9fb0bf;border:1px solid #304350;}
+  .btn-outline:hover{background:#2a3c4b;color:#fff;}
+  .btn-disabled{opacity:.45;cursor:not-allowed;}
+  .panel{background:#1f2c36;border:1px solid #304350;border-radius:12px;padding:20px 22px 24px;position:relative;}
+  .panel-title{margin:0 0 14px;font-size:.78rem;text-transform:uppercase;letter-spacing:.55px;color:#9fb0bf;font-weight:600;display:flex;gap:10px;align-items:center;}
+  .badge{background:#243645;border:1px solid #304350;padding:3px 8px;border-radius:30px;font-size:.56rem;letter-spacing:.5px;color:#9fb0bf;display:inline-flex;align-items:center;gap:4px;}
+  .badge.status.good{background:#1c3b31;color:#38d398;border-color:#285746;}
+  .badge.status.warn{background:#3d3620;color:#f5c156;border-color:#5c4d25;}
+  .badge.status.bad{background:#462b2b;color:#e79898;border-color:#6d3b3b;}
+  .candidate-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:22px;}
+  .card{background:#243441;border:1px solid #324556;border-radius:16px;padding:16px 18px 18px;display:flex;flex-direction:column;gap:8px;transition:transform .15s,border .15s,box-shadow .15s;position:relative;}
+  .card:hover{transform:translateY(-3px);border-color:#4d87ff;box-shadow:0 6px 24px -10px rgba(0,0,0,.6);}
+  .card.pruned{opacity:.55;filter:grayscale(.35);}
+  .card h3{margin:0;font-size:.92rem;font-weight:600;}
+  .row-meta{display:flex;flex-wrap:wrap;gap:6px;}
+  .tag{background:#2d3f4e;border:1px solid #3b5160;padding:2px 6px;border-radius:7px;font-size:.55rem;letter-spacing:.4px;color:#9fb0bf;}
+  .tag.good{background:#1c3b31;color:#38d398;border-color:#285746;}
+  .tag.bad{background:#4e3131;color:#f0a2a2;border-color:#6b4444;}
+  .snippet{font-size:.63rem;line-height:1.35;background:#1b2731;padding:10px 12px;border-radius:8px;border:1px solid #314351;max-height:100px;overflow:auto;color:#d4e2ec;}
+  .footer-line{font-size:.55rem;color:#6c8496;display:flex;flex-wrap:wrap;gap:6px;}
+  .empty{font-size:.66rem;opacity:.65;padding:4px 2px;}
+  pre{margin:0;background:#121e27;border:1px solid #304350;border-radius:12px;padding:16px;font-size:.62rem;line-height:1.4;max-height:260px;overflow:auto;color:#d3e0ea;}
+  footer{background:#101a22;border-top:1px solid #253543;padding:14px 24px;font-size:.63rem;text-align:center;color:#9fb0bf;}
+  .switch-row{display:flex;align-items:center;gap:8px;font-size:.66rem;color:#9fb0bf;margin:4px 0 14px;}
+  .switch-row input{width:auto;margin:0;}
+  @media (max-width:1080px){main{grid-template-columns:100%;}aside{border-right:none;border-bottom:1px solid #253543;} .main{padding:24px 26px 140px;}}
+</style>
+</head>
+<body>
+<header>
+  <h1>TalentChat</h1>
+  <div style="display:flex;gap:10px;align-items:center;">
+    <span id="envBadge" class="badge"></span>
+    <span id="statusBadge" class="badge status">Idle</span>
+  </div>
+</header>
+<main>
+  <aside>
+    <label>Email
+      <input id="emailInput" type="email" placeholder="you@example.com" autocomplete="email">
+    </label>
+    <label>Ranking Mode
+      <select id="rankingMode">
+        <option value="deterministic" selected>Deterministic</option>
+        <option value="llm">LLM (disabled)</option>
+      </select>
+    </label>
+    <div class="switch-row"><input type="checkbox" id="includeQs" checked><span>Interview Questions</span></div>
+    <div class="switch-row"><input type="checkbox" id="showPruned"><span>Show Pruned</span></div>
+    <div class="switch-row"><input type="checkbox" id="showDebug"><span>Debug Fields</span></div>
+    <div class="switch-row"><input type="checkbox" id="inlineResume"><span>Force Inline Resume</span></div>
+    <div style="margin:10px 0 28px;"><button class="btn-secondary" type="button" onclick="saveEmail()">Save Email</button></div>
+    <div class="panel" style="padding:14px 16px;">
+      <p style="margin:0 0 6px;font-size:.70rem;font-weight:600;letter-spacing:.5px;">Instructions</p>
+      <ol style="margin:0;padding:0 0 0 16px;font-size:.58rem;line-height:1.35;">
+        <li>Enter email & JD</li>
+        <li>Search candidates</li>
+        <li>Open resume</li>
+        <li>Generate questions</li>
+      </ol>
+    </div>
+  </aside>
+  <div class="main">
+    <div class="panel">
+      <div class="panel-title">Job Description <span id="displayCount" class="badge" style="display:none;"></span></div>
+      <textarea id="jdInput" placeholder="Paste or type the job description ..."></textarea>
+      <div style="display:flex;gap:12px;align-items:center;margin-top:14px;">
+        <button id="searchBtn" class="btn-primary" type="button">Search Candidates</button>
+        <span id="searchStatus" style="font-size:.63rem;color:#9fb0bf;"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Top Candidates</div>
+      <div id="candidates" class="candidate-grid">
+        <div class="empty">No candidates yet.</div>
+      </div>
+    </div>
+    <div id="questionsPanel" class="panel" style="display:none;">
+      <div class="panel-title">Interview Questions</div>
+      <div id="questionsContainer" class="empty">No questions generated.</div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Diagnostics</div>
+      <pre id="diagBox">{}</pre>
+    </div>
+  </div>
+</main>
+<footer>&copy; <span id="yearSpan"></span> TalentChat – UI v3.2</footer>
+<script>
+const qs = s=>document.querySelector(s);
+const emailInput=qs("#emailInput");
+const jdInput=qs("#jdInput");
+const rankingModeSel=qs("#rankingMode");
+const candidatesWrap=qs("#candidates");
+const diagBox=qs("#diagBox");
+const searchStatus=qs("#searchStatus");
+const statusBadge=qs("#statusBadge");
+const displayCount=qs("#displayCount");
+const includeQs=qs("#includeQs");
+const showPruned=qs("#showPruned");
+const showDebug=qs("#showDebug");
+const inlineResume=qs("#inlineResume");
+
+document.getElementById("yearSpan").textContent=(new Date()).getFullYear();
+qs("#envBadge").textContent=window.location.hostname||"local";
+const saved=localStorage.getItem("talentchat_email"); if(saved) emailInput.value=saved;
+
+let lastData=null;
+
+function escapeHtml(str){
+  return String(str||"").replace(/[&<>"']/g,s=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
+}
+function escapeJs(str){
+  return String(str||"").replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,' ');
+}
+
+function setStatus(txt,mode){
+  statusBadge.textContent=txt;
+  statusBadge.classList.remove("good","warn","bad");
+  if(mode) statusBadge.classList.add(mode);
+}
+
+function toast(msg,err){
+  let el=qs("#toast");
+  if(!el){
+    el=document.createElement("div");
+    el.id="toast";
+    el.style.position="fixed";
+    el.style.bottom="22px";
+    el.style.right="22px";
+    el.style.background="#4d87ff";
+    el.style.padding="10px 16px";
+    el.style.fontSize=".68rem";
+    el.style.fontWeight="600";
+    el.style.color="#fff";
+    el.style.borderRadius="10px";
+    el.style.boxShadow="0 6px 22px -8px rgba(0,0,0,.55)";
+    el.style.zIndex="9999";
+    document.body.appendChild(el);
+  }
+  el.style.background = err? "#d45c5c" : "#4d87ff";
+  el.textContent=msg;
+  el.style.opacity="1";
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>{el.style.transition="opacity .6s";el.style.opacity="0";},2500);
+}
+
+function saveEmail(){
+  const v=emailInput.value.trim();
+  if(!v){toast("Enter email",true);return;}
+  localStorage.setItem("talentchat_email",v);
+  toast("Email saved");
+}
+
+qs("#searchBtn").addEventListener("click", doSearch);
+showPruned.addEventListener("change", renderCandidates);
+showDebug.addEventListener("change", renderCandidates);
+
+function getCSRF(){
+  const meta=document.querySelector('meta[name="csrf-token"]');
+  if(meta){
+    const div=document.createElement('div');div.innerHTML=meta.getAttribute('content');
+    const inp=div.querySelector('input[name=csrfmiddlewaretoken]'); if(inp) return inp.value;
+  }
+  const m=document.cookie.match(/csrftoken=([^;]+)/);return m?m[1]:"";
+}
+
+function doSearch(){
+  const email=emailInput.value.trim();
+  const jd=jdInput.value.trim();
+  const mode=rankingModeSel.value;
+  if(!email){toast("Email required",true);emailInput.focus();return;}
+  if(!jd){toast("JD required",true);jdInput.focus();return;}
+  setStatus("Searching","warn");
+  searchStatus.textContent="Searching...";
+  candidatesWrap.innerHTML='<div class="empty">Loading...</div>';
+  displayCount.style.display="none";
+  fetch("/api/chat/get_candidates_for_jd/",{
+    method:"POST",
+    headers:{"Content-Type":"application/json","X-CSRFToken":getCSRF()},
+    body:JSON.stringify({email_id:email, job_description:jd, ranking_mode:mode, top_k:5})
+  })
+  .then(r=>r.json().then(j=>[r.status,j]))
+  .then(([status,data])=>{
+    if(status!==200){
+      searchStatus.textContent="Error";
+      setStatus("Error","bad");
+      candidatesWrap.innerHTML='<div class="empty">Error: '+escapeHtml(JSON.stringify(data))+'</div>';
+      diagBox.textContent=JSON.stringify(data,null,2);
+      toast("Search failed",true);
+      return;
+    }
+    console.log("Candidate retrieval response:", data);
+    lastData=data;
+    renderCandidates();
+    diagBox.textContent=JSON.stringify(data.diagnostics||{},null,2);
+    searchStatus.textContent="Done";
+    setStatus("Ready","good");
+  })
+  .catch(e=>{
+    searchStatus.textContent="Error";
+    setStatus("Error","bad");
+    candidatesWrap.innerHTML='<div class="empty">Network error: '+escapeHtml(e.message)+'</div>';
+    toast("Network error",true);
+  });
+}
+
+function renderCandidates(){
+  if(!lastData){
+    candidatesWrap.innerHTML='<div class="empty">No results.</div>';return;
+  }
+  const list=lastData.top_candidates||[];
+  const allowPruned=showPruned.checked;
+  let visible=list.filter(c=>allowPruned||!c.pruned);
+  if(!visible.length){
+    candidatesWrap.innerHTML='<div class="empty">No candidates (all pruned hidden).</div>';return;
+  }
+  candidatesWrap.innerHTML="";
+  visible.forEach(c=>{
+    const card=document.createElement("div");
+    card.className="card";
+    if(c.pruned) card.classList.add("pruned");
+    const rank=c.final_rank?('#'+c.final_rank):'';
+    const score=(c.raw_norm!=null)?Number(c.raw_norm).toFixed(2):"-";
+    const cov=(c.coverage_score!=null)?Number(c.coverage_score).toFixed(2):"-";
+    const bonus=(c.bonus_total!=null)?Number(c.bonus_total).toFixed(2):"-";
+    const comp=(c.composite_rank_score!=null)?Number(c.composite_rank_score).toFixed(3):"-";
+    const conf=(c.candidate_name_confidence!=null)?Number(c.candidate_name_confidence).toFixed(2):"-";
+    const snippet=(c.matched_chunks||[]).slice(0,1).map(m=>escapeHtml((m.content||"").slice(0,280))).join("");
+    const resumeOk = !!(c.resume_url || c.aggregated_text || (c.resume_url_alternatives||[]).length);
+    const debugExtra = showDebug.checked ? `
+      <div class="footer-line" style="margin-top:6px;">
+        <span>Src:${escapeHtml(c.candidate_name_source||'')}</span>
+        <span>ID:${escapeHtml(c.candidate_id||'')}</span>
+        ${c.pruned_reason?'<span class="tag bad">Prune:'+escapeHtml(c.pruned_reason)+'</span>':''}
+      </div>` : "";
+    const cid = escapeJs(c.candidate_id||"");
+    const cname = escapeJs(c.candidate_name||"Candidate");
+    card.innerHTML = `
+      <h3>${escapeHtml(c.candidate_name||"Candidate")}</h3>
+      <div class="row-meta">
+        ${rank?'<span class="tag good">Rank '+escapeHtml(rank)+'</span>':''}
+        <span class="tag">Score ${score}</span>
+        <span class="tag">Cov ${cov}</span>
+        <span class="tag">Bonus ${bonus}</span>
+        <span class="tag">Comp ${comp}</span>
+        <span class="tag">Conf ${conf}</span>
+      </div>
+      <div class="snippet">${snippet||'<em>No preview</em>'}</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px;">
+        <button class="btn-secondary ${resumeOk?'':'btn-disabled'}" type="button"
+          ${resumeOk?`onclick="openResume('${cid}')"`:'disabled'}>
+          Resume
+        </button>
+        ${
+          includeQs.checked
+          ? `<button class="btn-outline" type="button" onclick="generateQuestions('${cid}','${cname}')">Questions</button>`
+          : ''
+        }
+      </div>
+      <div class="footer-line">
+        <span>Chunks: ${(c.matched_chunks||[]).length}</span>
+        <span>Emails: ${(c.contact_emails||[]).length}</span>
+        <span>Phones: ${(c.contact_phones||[]).length}</span>
+      </div>
+      ${debugExtra}
+    `;
+    candidatesWrap.appendChild(card);
+  });
+  displayCount.textContent=`${visible.length} displayed (${list.length} total)`;
+  displayCount.style.display="inline-flex";
+  console.log("Rendered candidates:", visible.map(c=>c.candidate_id));
+}
+
+window.openResume = function(candidateId){
+  console.log("openResume called with candidateId:", candidateId);
+  if(!lastData){ toast("No data", true); return; }
+  const cand = (lastData.top_candidates||[]).find(c=>c.candidate_id===candidateId);
+  if(!cand){ toast("Candidate not found", true); return; }
+  if(inlineResume.checked || !cand.resume_url){
+    const html = `
+      <html><head><title>${cand.candidate_name||'Resume'}</title>
+      <meta charset="utf-8">
+      <style>
+        body{font-family:system-ui,Arial,sans-serif;margin:0;padding:24px;line-height:1.4;background:#0f171f;color:#e2e8f0;}
+        h1{font-size:1.2rem;margin:0 0 16px;}
+        pre{white-space:pre-wrap;font-size:.78rem;background:#1d2a33;padding:16px;border-radius:8px;border:1px solid #2f4250;max-height:calc(100vh - 140px);overflow:auto;}
+      </style></head>
+      <body>
+        <h1>${escapeHtml(cand.candidate_name||"Candidate")}</h1>
+        <pre>${escapeHtml(cand.aggregated_text||((cand.matched_chunks||[]).map(m=>m.content).join("\\n\\n"))||"No text available")}</pre>
+      </body></html>
+    `;
+    const blob = new Blob([html], {type:"text/html"});
+    const url = URL.createObjectURL(blob);
+    window.open(url,"_blank","noopener,noreferrer");
+    return;
+  }
+  window.open(cand.resume_url,"_blank","noopener,noreferrer");
+};
+
+window.generateQuestions = function(candidateId, name){
+  console.log("generateQuestions called with id:", candidateId);
+  const jd = jdInput.value.trim();
+  const email = emailInput.value.trim();
+  if(!jd){ toast("JD missing", true); return; }
+  const panel = qs("#questionsPanel");
+  const container = qs("#questionsContainer");
+  panel.style.display="block";
+  container.innerHTML='<div class="empty">Generating for '+escapeHtml(name)+'...</div>';
+  fetch("/api/chat/generate_interview_questions/", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","X-CSRFToken":getCSRF()},
+    body:JSON.stringify({
+      candidate_id: candidateId,
+      candidate_name: name,
+      job_description: jd,
+      email_id: email
+    })
+  })
+  .then(r=>r.json().then(j=>[r.status,j]))
+  .then(([status,data])=>{
+    if(status!==200){
+      console.error("Questions error response:", data);
+      container.innerHTML='<div class="empty" style="color:#e79898;">Error: '+escapeHtml(JSON.stringify(data))+'</div>';
+      toast("Question generation failed", true);
+      return;
+    }
+    console.log("Questions response:", data);
+    const arr=data.questions||[];
+    if(!arr.length){
+      container.innerHTML='<div class="empty">No questions returned.</div>';
+      return;
+    }
+    const ol=document.createElement("ol");
+    ol.style.fontSize=".70rem"; ol.style.lineHeight="1.4";
+    arr.forEach(q=>{
+      const li=document.createElement("li");
+      li.textContent=typeof q==="string"?q:JSON.stringify(q);
+      ol.appendChild(li);
+    });
+    container.innerHTML="";
+    container.appendChild(ol);
+  })
+  .catch(e=>{
+    console.error("Questions fetch error:", e);
+    container.innerHTML='<div class="empty" style="color:#e79898;">Error: '+escapeHtml(e.message)+'</div>';
+  });
+};
+</script>
+</body>
+</html>

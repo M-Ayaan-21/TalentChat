@@ -1,7 +1,37 @@
-import asyncio
-import base64
-import logging
+"""
+api/views.py
 
+Unified view layer including:
+ - Candidate retrieval (stores enriched bundles for later question generation)
+ - Interview question generation (JD + candidate resume context -> OpenAI or fallback)
+ - Chat endpoints (text, voice, TTS, ASR)
+ - Language preference endpoints
+ - Index / health
+
+Requires:
+ - retrieval/content_retrieval.py (v18.1 or later) exposing content_retrieval
+ - api/question_generator.py exposing generate_candidate_questions
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+from django.http import HttpResponse
+from django.shortcuts import render
+from django.views.decorators.csrf import csrf_exempt
+
+from rest_framework import status
+from rest_framework.decorators import action, api_view
+from rest_framework.response import Response
+from rest_framework.viewsets import GenericViewSet
+
+from django.core.files.uploadedfile import InMemoryUploadedFile
+
+# Project utilities
 from api.utils import (
     authenticate_user_based_on_email,
     handle_input_query,
@@ -12,159 +42,308 @@ from api.utils import (
 )
 from common.constants import Constants
 from common.utils import get_user_by_email, set_user_preferred_language
-from django.core.files.uploadedfile import InMemoryUploadedFile
-from drf_yasg import openapi
-from drf_yasg.utils import swagger_auto_schema
 from language_service.utils import get_all_languages, get_language_by_id
-from rest_framework import status
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.viewsets import GenericViewSet
+
+# Retrieval + Question Generation
+from retrieval.content_retrieval import content_retrieval
+from api.question_generator import generate_candidate_questions
 
 logger = logging.getLogger(__name__)
 
+# -------------------------------------------------------------------
+# Constants / simple validators
+# -------------------------------------------------------------------
+ALLOWED_RANKING_MODES = {"deterministic", "llm"}  # currently deterministic emphasized
+DEFAULT_TOP_K = 5
+MAX_TOP_K = 15
 
-class ChatAPIViewSet(GenericViewSet):
+
+def _validate_top_k(v: Any) -> int:
+    try:
+        k = int(v)
+        return max(1, min(MAX_TOP_K, k))
+    except Exception:
+        return DEFAULT_TOP_K
+
+
+def _validate_ranking_mode(m: Optional[str]) -> str:
+    if not m:
+        return "deterministic"
+    m = m.lower()
+    return m if m in ALLOWED_RANKING_MODES else "deterministic"
+
+
+# -------------------------------------------------------------------
+# Retrieval Cache
+# Per email:
+# {
+#   "jd": <last job description>,
+#   "candidates_map": {
+#        candidate_id: {
+#          candidate_id, candidate_name,
+#          selection_summary, deterministic_summary,
+#          aggregated_text, matched_chunks, resume_url
+#        }
+#    }
+# }
+# -------------------------------------------------------------------
+LAST_RETRIEVAL_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+# -------------------------------------------------------------------
+# Basic pages
+# -------------------------------------------------------------------
+def index(request):
+    return render(request, "index.html")
+
+
+home = index  # alias
+
+
+def health(request):
+    return HttpResponse("ok", status=200)
+
+
+# -------------------------------------------------------------------
+# Candidate Retrieval Endpoint
+# -------------------------------------------------------------------
+@csrf_exempt
+@api_view(["POST"])
+def get_candidates_for_jd(request):
     """
-    Custom ViewSet chat services
+    POST JSON:
+    {
+      "email_id": "...",
+      "job_description": "...",
+      "ranking_mode": "deterministic" | "llm",
+      "top_k": 5
+    }
 
-    Actions (operations)
-    --------------------
-        Get Answer for Text Query :
-            generate answer for a given user text query in text
-        Synthesise Audio :
-            generate audio in base64 format for a given text using Text-to-Speech
-        Transcribe Audio :
-            generate transcriptions or text for given voice query using Speech-to-Text
-        Get Answer by Voice Query :
-            generate answer for a given user voice query in voice
+    Returns:
+        Retrieval payload: { top_candidates: [...], diagnostics: {...} }
 
+    Side effects:
+        Populates LAST_RETRIEVAL_CACHE[email_id] with enriched candidate bundles
+        for later question generation.
     """
+    data = request.data or {}
+    email_id = data.get("email_id")
+    jd = data.get("job_description")
+    ranking_mode = _validate_ranking_mode(data.get("ranking_mode"))
+    top_k = _validate_top_k(data.get("top_k"))
 
-    authentication_classes = []
+    if not email_id or not jd:
+        return Response({"error": "Missing email_id or job_description"}, status=400)
 
-    @action(detail=False, methods=["post"])
-    def get_answer_for_text_query(self, request):
-        """
-        Generate answer for a given user query
-        """
-        email_id = request.data.get("email_id")
-        original_query = request.data.get("query")
-        response_data = Response(
-            {"message": None, "query": original_query, "error": False}
+    try:
+        result = content_retrieval(
+            job_description=jd,
+            email=email_id,
+            top_k=top_k,
+            ranking_mode=ranking_mode,
         )
-        response_map = {}
-        authenticated_user = None
 
-        try:
-            # check for authenticated user using email
-            authenticated_user = authenticate_user_based_on_email(email_id)
+        bundle_map: Dict[str, Dict[str, Any]] = {}
+        for c in result.get("top_candidates", []):
+            bundle_map[c["candidate_id"]] = {
+                "candidate_id": c["candidate_id"],
+                "candidate_name": c.get("candidate_name"),
+                "selection_summary": c.get("selection_summary"),
+                "deterministic_summary": c.get("deterministic_summary"),
+                "aggregated_text": c.get("aggregated_text", ""),
+                "matched_chunks": c.get("matched_chunks", []),
+                "resume_url": c.get("resume_url"),
+            }
 
-            # if is_authenticated == False:
-            if not authenticated_user:
-                response_data.data["message"] = "Invalid Email ID"
-                response_data.status_code = status.HTTP_401_UNAUTHORIZED
-                return response_data
-                # return Response(response_data, status=status.HTTP_401_UNAUTHORIZED)
+        LAST_RETRIEVAL_CACHE[email_id] = {
+            "jd": jd,
+            "candidates_map": bundle_map,
+        }
 
-            if not original_query:
-                response_data.data["message"] = "Please submit a query."
-                response_data.status_code = status.HTTP_400_BAD_REQUEST
-                return response_data
+        return Response(result, status=200)
+    except Exception as e:
+        logger.error("Candidate retrieval failed: %s", e, exc_info=True)
+        return Response({"error": "retrieval_failed", "detail": str(e)}, status=500)
 
-            response_map = process_query(original_query, email_id, authenticated_user)
 
-            # update actual response body
-            response_data.data["message"] = (
-                "Successful retrieval of response for above query"
-            )
-            response_data.data["message_id"] = response_map.get("message_id")
-            response_data.data["response"] = response_map.get("translated_response")
-            response_data.data["source"] = response_map.get("source", None)
-            response_data.data["follow_up_questions"] = response_map.get(
-                "follow_up_questions"
-            )
+# -------------------------------------------------------------------
+# Interview Question Generation
+# -------------------------------------------------------------------
+@csrf_exempt
+@api_view(["POST"])
+def generate_interview_questions(request):
+    """
+    POST JSON:
+    {
+      "candidate_id": "...",
+      "candidate_name": "...",          (optional)
+      "summary": "...",                 (optional – fallback if cache missing)
+      "job_description": "...",         (optional – fallback to cached JD if email_id provided)
+      "email_id": "..."                 (optional but recommended)
+    }
 
-        except Exception as error:
-            logger.error(error, exc_info=True)
-            response_data.data.update(
-                {"message": "Something went wrong", "error": True}
-            )
-            response_data.status_code = status_code = (
-                status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+    Returns: { "questions": [ ... ] }
 
-        return response_data
+    Workflow:
+      - Retrieve candidate bundle from LAST_RETRIEVAL_CACHE[email_id] if available.
+      - Use job_description from payload or cached JD.
+      - Combine JD + aggregated_text + summaries and call generate_candidate_questions.
+    """
+    data = request.data or {}
+    candidate_id = data.get("candidate_id")
+    candidate_name = data.get("candidate_name") or "Candidate"
+    supplied_summary = data.get("summary") or ""
+    email_id = data.get("email_id")
+    jd = data.get("job_description")
 
-    @action(detail=False, methods=["post"])
-    def synthesise_audio(self, request):
-        """
-        Generate audio in base64 format using Text-to-speech for a given text
-        """
-        email_id = request.data.get("email_id")
-        original_text = request.data.get("text")
-        message_id = request.data.get("message_id")
-        response_data = Response({"message": None, "error": False, "audio": None})
+    if not candidate_id:
+        return Response({"error": "candidate_id required"}, status=400)
 
-        try:
-            # check for authenticated user using email
-            authenticated_user = authenticate_user_based_on_email(email_id)
+    # Base bundle (will enrich if cache present)
+    bundle = {
+        "candidate_name": candidate_name,
+        "selection_summary": supplied_summary,
+        "deterministic_summary": supplied_summary,
+        "aggregated_text": "",
+        "matched_chunks": [],
+        "resume_url": None,
+    }
 
-            # if is_authenticated == False:
-            if not authenticated_user:
-                response_data.data["message"] = "Invalid Email ID"
-                response_data.status_code = status.HTTP_401_UNAUTHORIZED
-                return response_data
-                # return Response(response_data, status=status.HTTP_401_UNAUTHORIZED)
-
-            if not original_text:
-                response_data.data["message"] = (
-                    "Please submit text for audio synthesis."
-                )
-                response_data.status_code = status.HTTP_400_BAD_REQUEST
-                return response_data
-
-            response_audio = process_output_audio(original_text, message_id)
-
-            if not response_audio:
-                response_data.data.update(
-                    {
-                        "message": "Invalid base64 string or unable to generate transcriptions currently.",
-                        "audio": input_audio_base64,
-                    }
-                )
-                response_data.status_code = status.HTTP_401_UNAUTHORIZED
-                return response_data
-                # return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
-
-            response_data.data.update(
+    if email_id and email_id in LAST_RETRIEVAL_CACHE:
+        cache_entry = LAST_RETRIEVAL_CACHE[email_id]
+        if not jd:
+            jd = cache_entry.get("jd")
+        cm = cache_entry.get("candidates_map", {})
+        if candidate_id in cm:
+            cached = cm[candidate_id]
+            bundle.update(
                 {
-                    "text": original_text,
-                    "audio": response_audio,
-                    "message": "Audio synthesis successful",
+                    "candidate_name": cached.get("candidate_name") or candidate_name,
+                    "selection_summary": cached.get("selection_summary")
+                    or cached.get("deterministic_summary"),
+                    "deterministic_summary": cached.get("deterministic_summary"),
+                    "aggregated_text": cached.get("aggregated_text", ""),
+                    "matched_chunks": cached.get("matched_chunks", []),
+                    "resume_url": cached.get("resume_url"),
                 }
             )
 
-        except Exception as error:
-            logger.error(error, exc_info=True)
-            response_data.data.update(
-                {"message": "Something went wrong", "error": True}
-            )
-            response_data.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    if not jd:
+        return Response(
+            {
+                "error": "job_description missing and no cached JD found for this email"
+            },
+            status=400,
+        )
 
-        return response_data
+    try:
+        questions = generate_candidate_questions(jd, bundle)
+        return Response({"questions": questions}, status=200)
+    except Exception as e:
+        logger.error("Question generation failed: %s", e, exc_info=True)
+        return Response(
+            {"error": "question_generation_failed", "detail": str(e)}, status=500
+        )
+
+
+# -------------------------------------------------------------------
+# Chat / Voice Q&A ViewSet
+# -------------------------------------------------------------------
+class ChatAPIViewSet(GenericViewSet):
+    """
+    Chat Service ViewSet
+      - get_answer_for_text_query
+      - synthesise_audio
+      - transcribe_audio
+      - get_answer_by_voice_query
+    """
+
+    authentication_classes: list = []
+
+    @action(detail=False, methods=["post"])
+    def get_answer_for_text_query(self, request):
+        email_id = request.data.get("email_id")
+        original_query = request.data.get("query")
+        resp = Response({"message": None, "query": original_query, "error": False})
+
+        try:
+            user = authenticate_user_based_on_email(email_id)
+            if not user:
+                resp.data["message"] = "Invalid Email ID"
+                resp.status_code = status.HTTP_401_UNAUTHORIZED
+                return resp
+            if not original_query:
+                resp.data["message"] = "Please submit a query."
+                resp.status_code = status.HTTP_400_BAD_REQUEST
+                return resp
+
+            result = process_query(original_query, email_id, user)
+            resp.data.update(
+                {
+                    "message": "Successful retrieval of response for above query",
+                    "message_id": result.get("message_id"),
+                    "response": result.get("translated_response"),
+                    "source": result.get("source"),
+                    "follow_up_questions": result.get("follow_up_questions"),
+                }
+            )
+        except Exception as e:
+            logger.error("Text query failure", exc_info=True)
+            resp.data.update(
+                {"message": "Something went wrong", "error": True, "detail": str(e)}
+            )
+            resp.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        return resp
+
+    @action(detail=False, methods=["post"])
+    def synthesise_audio(self, request):
+        email_id = request.data.get("email_id")
+        text = request.data.get("text")
+        message_id = request.data.get("message_id")
+        resp = Response({"message": None, "error": False, "audio": None})
+
+        try:
+            user = authenticate_user_based_on_email(email_id)
+            if not user:
+                resp.data["message"] = "Invalid Email ID"
+                resp.status_code = status.HTTP_401_UNAUTHORIZED
+                return resp
+            if not text:
+                resp.data["message"] = "Please submit text for audio synthesis."
+                resp.status_code = status.HTTP_400_BAD_REQUEST
+                return resp
+
+            audio_b64 = process_output_audio(text, message_id)
+            if not audio_b64:
+                resp.data.update(
+                    {
+                        "message": "Unable to synthesize audio currently.",
+                        "audio": None,
+                    }
+                )
+                resp.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+                return resp
+
+            resp.data.update(
+                {"message": "Audio synthesis successful", "text": text, "audio": audio_b64}
+            )
+        except Exception as e:
+            logger.error("TTS error", exc_info=True)
+            resp.data.update(
+                {"message": "Something went wrong", "error": True, "detail": str(e)}
+            )
+            resp.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        return resp
 
     @action(detail=False, methods=["post"])
     def transcribe_audio(self, request):
-        """
-        Generate transcriptions or text for given voice query using Speech-to-Text
-        """
-        email_id = request.data.get("email_id", None)
-        original_query = request.data.get("query", None)
-        query_language_bcp_code = request.data.get(
+        email_id = request.data.get("email_id")
+        original_query = request.data.get("query")
+        language_bcp = request.data.get(
             "query_language_bcp_code", Constants.LANGUAGE_BCP_CODE_NATIVE
         )
-        response_data = Response(
+
+        resp = Response(
             {
                 "message": None,
                 "heard_input_query": None,
@@ -173,98 +352,74 @@ class ChatAPIViewSet(GenericViewSet):
                 "error": False,
             }
         )
-        response_map = {}
-        authenticated_user, input_query_file = None, None
 
         try:
-            # check for authenticated user using email
-            authenticated_user = authenticate_user_based_on_email(email_id)
-
-            # if is_authenticated == False:
-            if not authenticated_user:
-                response_data.data["message"] = "Invalid Email ID"
-                response_data.status_code = status.HTTP_401_UNAUTHORIZED
-                return response_data
-                # return Response(response_data, status=status.HTTP_401_UNAUTHORIZED)
-
-            if not original_query:
-                response_data.data["message"] = (
-                    "Please share a valid base64 string as a query."
-                )
-                response_data.status_code = status.HTTP_400_BAD_REQUEST
-                return response_data
+            user = authenticate_user_based_on_email(email_id)
+            if not user:
+                resp.data["message"] = "Invalid Email ID"
+                resp.status_code = status.HTTP_401_UNAUTHORIZED
+                return resp
+            if not original_query and not request.FILES:
+                resp.data["message"] = "Please provide audio (file or base64)."
+                resp.status_code = status.HTTP_400_BAD_REQUEST
+                return resp
 
             input_query = (
                 request.FILES.get("query")
-                if len(request.FILES) >= 1
+                if request.FILES and "query" in request.FILES
                 else original_query
             )
             if isinstance(input_query, InMemoryUploadedFile):
                 input_query.seek(0)
-                file_content = input_query.read()
-                input_query = base64.b64encode(bytes(file_content))
+                file_bytes = input_query.read()
+                input_query = base64.b64encode(file_bytes)
 
             input_query_file = handle_input_query(input_query)
-
             if not input_query_file:
-                response_data.data["message"] = "Invalid file or base64 string."
-                response_data.status_code = status.HTTP_400_BAD_REQUEST
-                return response_data
-                # return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+                resp.data["message"] = "Invalid file or base64 audio."
+                resp.status_code = status.HTTP_400_BAD_REQUEST
+                return resp
 
-            response_map = process_transcriptions(
+            transcribed = process_transcriptions(
                 input_query_file,
                 email_id,
-                authenticated_user,
-                language_bcp_code=query_language_bcp_code,
+                user,
+                language_bcp_code=language_bcp,
             )
-            message_id = response_map.get("message_id")
-            confidence_score = response_map.get("confidence_score")
-            heard_input_query = response_map.get("transcriptions")
-            response_data.data.update(
+
+            confidence = transcribed.get("confidence_score", 0)
+            heard_text = transcribed.get("transcriptions")
+            resp.data.update(
                 {
-                    "message": "Unfortunately unable to transcribe the above voice input query.",
-                    "message_id": message_id,
-                    "confidence_score": confidence_score,
-                    "heard_input_query": heard_input_query,
+                    "message": "Transcription complete."
+                    if confidence > Constants.ASR_DEFAULT_CONFIDENCE_SCORE
+                    else "Low confidence transcription.",
+                    "message_id": transcribed.get("message_id"),
+                    "confidence_score": confidence,
+                    "heard_input_query": heard_text,
                 }
             )
 
             if (
-                confidence_score
-                and confidence_score > Constants.ASR_DEFAULT_CONFIDENCE_SCORE
+                confidence > Constants.ASR_DEFAULT_CONFIDENCE_SCORE
+                and heard_text
             ):
-                input_audio_base64 = process_input_audio_to_base64(
-                    heard_input_query, response_map.get("message_id")
-                )
-                response_data.data.update(
-                    {
-                        "message": "Successful transcription for above input voice query.",
-                        "heard_input_audio": input_audio_base64,
-                    }
+                resp.data["heard_input_audio"] = process_input_audio_to_base64(
+                    heard_text, transcribed.get("message_id")
                 )
 
-        except Exception as error:
-            logger.error(error, exc_info=True)
-            response_data.data.update(
-                {"message": "Something went wrong", "error": True}
+        except Exception as e:
+            logger.error("ASR error", exc_info=True)
+            resp.data.update(
+                {"message": "Something went wrong", "error": True, "detail": str(e)}
             )
-            response_data.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-            # return Response(response_data, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        return response_data
+            resp.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        return resp
 
     @action(detail=False, methods=["post"])
     def get_answer_by_voice_query(self, request):
-        """
-        Generate answer for a given user voice query in voice
-        """
-        email_id = request.data.get("email_id", None)
-        query = request.data.get("query", None)
-        query_language_bcp_code = request.data.get(
-            "query_language_bcp_code", Constants.LANGUAGE_BCP_CODE_NATIVE
-        )
-        response_data = Response(
+        email_id = request.data.get("email_id")
+        resp = Response(
             {
                 "message": None,
                 "heard_input_query": None,
@@ -275,205 +430,131 @@ class ChatAPIViewSet(GenericViewSet):
         )
 
         try:
-            transcribe_response = self.transcribe_audio(request)
-            transcribe_response_data = (
-                transcribe_response.data
-                if transcribe_response.status_code in [200, 400, 401, 500]
-                else response_data.data
-            )
-            confidence_score = transcribe_response_data.get("confidence_score", None)
-            response_data.data = transcribe_response_data
+            transcribed_resp = self.transcribe_audio(request)
+            resp.data.update(transcribed_resp.data)
+            resp.status_code = transcribed_resp.status_code
 
-            # if is_authenticated == False:
-            if transcribe_response.status_code == 401:
-                response_data.status_code = status.HTTP_401_UNAUTHORIZED
-                return response_data
-                # return Response(response_data, status=status.HTTP_401_UNAUTHORIZED)
+            if transcribed_resp.status_code != 200:
+                return resp
 
-            if transcribe_response.status_code == 400:
-                response_data.status_code = status.HTTP_400_BAD_REQUEST
-                return response_data
-                # return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+            confidence = resp.data.get("confidence_score", 0)
+            if confidence <= Constants.ASR_DEFAULT_CONFIDENCE_SCORE:
+                resp.data["message"] = "Transcription confidence too low to proceed."
+                return resp
 
-            if transcribe_response.status_code == 500:
-                response_data.data.update(
-                    {"message": "Something went wrong", "error": True}
-                )
-                response_data.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-                return response_data
-                # return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+            synthetic = request
+            synthetic.data._mutable = True  # type: ignore
+            synthetic.data["query"] = resp.data.get("heard_input_query")
 
-            if (
-                confidence_score
-                and confidence_score > Constants.ASR_DEFAULT_CONFIDENCE_SCORE
-            ):
-                updated_request_obj = request
-                updated_request_obj.data.update(
-                    {"query": transcribe_response_data.get("heard_input_query", None)}
-                )
-                get_answer_for_text_query_response = self.get_answer_for_text_query(
-                    updated_request_obj
-                )
-                get_answer_for_text_query_response_data = (
-                    get_answer_for_text_query_response.data
-                    if get_answer_for_text_query_response.status_code == 200
-                    else {}
-                )
-                response_data.data.update(
+            text_answer = self.get_answer_for_text_query(synthetic)
+            if text_answer.status_code == 200:
+                resp.data.update(
                     {
-                        "message": get_answer_for_text_query_response_data.get(
-                            "message", None
+                        "response": text_answer.data.get("response"),
+                        "follow_up_questions": text_answer.data.get(
+                            "follow_up_questions"
                         ),
-                        "message_id": transcribe_response_data.get("message_id", None),
-                        "heard_input_query": transcribe_response_data.get(
-                            "heard_input_query", None
-                        ),
-                        "heard_input_audio": transcribe_response_data.get(
-                            "heard_input_audio", None
-                        ),
-                        "confidence_score": transcribe_response_data.get(
-                            "confidence_score", None
-                        ),
-                        "response": get_answer_for_text_query_response_data.get(
-                            "response", None
-                        ),
-                        "follow_up_questions": get_answer_for_text_query_response_data.get(
-                            "follow_up_questions", None
-                        ),
+                        "message": "Voice query answered successfully",
                     }
                 )
-
-        except Exception as error:
-            logger.error(error, exc_info=True)
-            response_data.data.update(
-                {"message": "Something went wrong", "error": True}
+            else:
+                resp.data["message"] = "Transcription succeeded; answer generation failed."
+        except Exception as e:
+            logger.error("Voice Q&A error", exc_info=True)
+            resp.data.update(
+                {"message": "Something went wrong", "error": True, "detail": str(e)}
             )
-            response_data.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-            # response_data.update({"message": "Something went wrong", "error": True}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        return response_data
+            resp.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        return resp
 
 
+# -------------------------------------------------------------------
+# Language ViewSet
+# -------------------------------------------------------------------
 class LanguageViewSet(GenericViewSet):
-    """
-    ViewSet for Language model (`database.models.Language`)
-
-    Actions (operations)
-    --------------------
-        Languages :
-            list the supported languages
-        Set Language :
-            save the user preferred language
-
-    """
-
-    authentication_classes = []
+    authentication_classes: list = []
 
     @action(detail=False, methods=["get"])
     def languages(self, request):
-        """
-        Fetches the list of supported languages
-        """
-        email_id = request.GET.get("email_id", None)
-        response_data = Response({"message": None, "error": False, "language_data": []})
-
+        email_id = request.GET.get("email_id")
+        resp = Response({"message": None, "error": False, "language_data": []})
         try:
-            # check for authenticated user using email
-            authenticated_user = authenticate_user_based_on_email(email_id)
-
-            # if is_authenticated == False:
-            if not authenticated_user:
-                response_data.data["message"] = "Invalid Email ID"
-                response_data.status_code = status.HTTP_401_UNAUTHORIZED
-                return response_data
-                # return Response(response_data, status=status.HTTP_401_UNAUTHORIZED)
-
-            language_list = get_all_languages()
-            if len(language_list) >= 1:
-                response_data.data.update(
-                    {
-                        "message": "Successful retrieval of supported language list.",
-                        "language_data": language_list,
-                    }
-                )
-
-        except Exception as error:
-            logger.error(error, exc_info=True)
-            response_data.data.update(
-                {"message": "Something went wrong", "error": True}
+            user = authenticate_user_based_on_email(email_id)
+            if not user:
+                resp.data["message"] = "Invalid Email ID"
+                resp.status_code = status.HTTP_401_UNAUTHORIZED
+                return resp
+            languages = get_all_languages()
+            resp.data.update(
+                {
+                    "message": "Successful retrieval of supported language list."
+                    if languages
+                    else "No languages found.",
+                    "language_data": languages,
+                }
             )
-            response_data.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-
-        return response_data
+        except Exception as e:
+            logger.error("Language list error", exc_info=True)
+            resp.data.update(
+                {"message": "Something went wrong", "error": True, "detail": str(e)}
+            )
+            resp.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        return resp
 
     @action(detail=False, methods=["post"])
     def set_language(self, request):
-        """
-        Save the user preferred language
-        """
-        email_id = request.data.get("email_id", None)
-        language_id = request.data.get("language_id", None)
-        response_data = Response({"message": None, "error": False})
-        saved_user_preferred_language = None
+        email_id = request.data.get("email_id")
+        language_id = request.data.get("language_id")
+        resp = Response({"message": None, "error": False})
 
         try:
-            # check for authenticated user using email
-            authenticated_user = authenticate_user_based_on_email(email_id)
-
-            # if is_authenticated == False:
-            if not authenticated_user:
-                response_data.data["message"] = "Invalid Email ID"
-                response_data.status_code = status.HTTP_401_UNAUTHORIZED
-                return response_data
-                # return Response(response_data, status=status.HTTP_401_UNAUTHORIZED)
-
+            user = authenticate_user_based_on_email(email_id)
+            if not user:
+                resp.data["message"] = "Invalid Email ID"
+                resp.status_code = status.HTTP_401_UNAUTHORIZED
+                return resp
             if not language_id:
-                response_data.data["message"] = "Language ID not submitted"
-                response_data.status_code = status.HTTP_400_BAD_REQUEST
-                return response_data
-                # return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
+                resp.data["message"] = "Language ID not submitted"
+                resp.status_code = status.HTTP_400_BAD_REQUEST
+                return resp
 
-            user = get_user_by_email(email_id)
-            user_id = user.get("user_id")
-            language_id = int(language_id)
+            language_id_int = int(language_id)
+            language_dict = get_language_by_id(language_id_int)
+            if not language_dict or language_dict.get("language_id") != language_id_int:
+                resp.data["message"] = f"Language with ID {language_id} does not exist."
+                resp.status_code = status.HTTP_400_BAD_REQUEST
+                return resp
 
-            # verify language with language_id exists
-            language_dict = get_language_by_id(language_id)
-
-            if len(language_dict) >= 1 and language_dict["language_id"] == language_id:
-                saved_user_preferred_language = set_user_preferred_language(
-                    user_id, language_id
+            db_user = get_user_by_email(email_id)
+            user_id = db_user.get("user_id") if db_user else None
+            saved = set_user_preferred_language(user_id, language_id_int)
+            if saved:
+                resp.data["message"] = (
+                    f"Saved user's ({email_id}) preferred language: "
+                    f"{language_dict.get('display_name')}"
                 )
+                resp.status_code = status.HTTP_200_OK
             else:
-                response_data.data["message"] = (
-                    f"Language with ID {language_id} does not exist."
+                resp.data["message"] = (
+                    f"Unable to save user's ({email_id}) preferred language: "
+                    f"{language_dict.get('display_name')}"
                 )
-                response_data.status_code = status.HTTP_400_BAD_REQUEST
-                return response_data
-                # return Response(response_data, status=status.HTTP_400_BAD_REQUEST)
-
-            if saved_user_preferred_language:
-                response_data.data.update(
-                    {
-                        "message": f"Saved the user's ({email_id}) preferred language with {language_dict.get('display_name')}"
-                    }
-                )
-                response_data.status_code = status.HTTP_200_OK
-                return response_data
-
-            else:
-                response_data.data.update(
-                    {
-                        "message": f"Unable to save user's ({email_id}) preferred language with {language_dict.get('display_name')}"
-                    }
-                )
-                response_data.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
-
-        except Exception as error:
-            logger.error(error, exc_info=True)
-            response_data.data.update(
-                {"message": "Something went wrong", "error": True}
+                resp.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        except Exception as e:
+            logger.error("Set language error", exc_info=True)
+            resp.data.update(
+                {"message": "Something went wrong", "error": True, "detail": str(e)}
             )
-            response_data.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+            resp.status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        return resp
 
-        return response_data
+
+__all__ = [
+    "index",
+    "home",
+    "health",
+    "get_candidates_for_jd",
+    "generate_interview_questions",
+    "ChatAPIViewSet",
+    "LanguageViewSet",
+]

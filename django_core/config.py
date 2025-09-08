@@ -2,7 +2,7 @@ import os
 
 from dotenv import dotenv_values, load_dotenv
 
-# load_dotenv()
+load_dotenv()
 ENV_CONFIG = dotenv_values(encoding="utf-8")
 if os.path.isfile(".config.env"):
     ENV_CONFIG.update(dotenv_values(".config.env", encoding="utf-8"))
