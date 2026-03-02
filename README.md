@@ -22,25 +22,25 @@ TalentChat is built on the FarmerChat/Farmstack infrastructure, leveraging:
 
 ## Features
 
-### 🎯 Candidate Matching
+###  Candidate Matching
 - Semantic job description analysis
 - Resume parsing and vectorization
 - Multi-factor ranking (skills, experience, relevance)
 - Automatic candidate grouping and deduplication
 
-### 📊 Intelligent Ranking
+###  Intelligent Ranking
 - **Deterministic Mode**: Score-based ranking using coverage, relevance, and bonus factors
 - **LLM Mode**: GPT-powered ranking with reasoning
 - Composite scoring combining multiple signals
 
-### 💬 Interview Question Generation
+###  Interview Question Generation
 - Tailored questions based on candidate profile + job description
 - 5 aptitude MCQs
 - 2 coding challenges
 - 3 critical thinking scenarios
 - Experience-level appropriate difficulty
 
-### 🔍 Candidate Insights
+###  Candidate Insights
 - Automatic name extraction from resumes
 - Contact information extraction (emails, phones)
 - Skills and experience summarization
